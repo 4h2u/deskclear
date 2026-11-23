@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Deskclear
+Comment=Hide or show folders and files on the desktop
+Exec=deskclear
+Icon=view-hidden
+Terminal=false
+Categories=Utility;

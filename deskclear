@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Hide or show folders and loose files on a KDE Plasma 6 desktop. Panels stay."""
+
+import fcntl
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+FILE = "plasma-org.kde.plasma.desktop-appletsrc"
+CFG = Path.home() / ".config" / FILE
+STATE_DIR = Path.home() / ".local/share/deskclear"
+STATE = STATE_DIR / "state.json"
+BACKUP = STATE_DIR / "appletsrc.shown"
+PATTERN = "deskclear-nomatch"
+FOLDER_PLUGINS = {"org.kde.plasma.folder", "org.kde.desktopcontainment"}
+
+
+def die(msg):
+    print("deskclear: " + msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def kread(groups, key):
+    cmd = ["kreadconfig6", "--file", FILE]
+    for group in groups:
+        cmd += ["--group", group]
+    cmd += ["--key", key]
+    out = subprocess.run(cmd, text=True, capture_output=True)
+    if out.returncode != 0:
+        die(out.stderr.strip() or "kreadconfig6 failed")
+    return out.stdout.rstrip("\n")
+
+
+def kwrite(groups, key, value=None, delete=False):
+    cmd = ["kwriteconfig6", "--file", FILE]
+    for group in groups:
+        cmd += ["--group", group]
+    cmd += ["--key", key]
+    if delete:
+        cmd.append("--delete")
+    else:
+        cmd.append(value)
+    out = subprocess.run(cmd, text=True, capture_output=True)
+    if out.returncode != 0:
+        die(out.stderr.strip() or "kwriteconfig6 failed")
+
+
+def folder_ids(text=None):
+    ids = []
+    current = None
+    plugin = None
+    lines = text.splitlines() if text is not None else CFG.read_text(encoding="utf-8", errors="replace").splitlines()
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            if current and plugin in FOLDER_PLUGINS:
+                ids.append(current)
+            parts = line[1:-1].split("][")
+            if len(parts) == 2 and parts[0] == "Containments":
+                current = parts[1]
+                plugin = None
+            else:
+                current = None
+                plugin = None
+            continue
+        if current and line.startswith("plugin="):
+            plugin = line.split("=", 1)[1]
+    if current and plugin in FOLDER_PLUGINS:
+        ids.append(current)
+    return ids
+
+
+def plasmashell_pids():
+    out = subprocess.run(["pgrep", "-x", "plasmashell"], text=True, capture_output=True)
+    return [int(part) for part in out.stdout.split() if part]
+
+
+def wait_until(pred, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def shell_owns_bus():
+    out = subprocess.run(
+        [
+            "dbus-send",
+            "--session",
+            "--dest=org.freedesktop.DBus",
+            "--print-reply",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.NameHasOwner",
+            "string:org.kde.plasmashell",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    return "boolean true" in out.stdout
+
+
+def stop_shell():
+    for _ in range(4):
+        if not plasmashell_pids():
+            return
+        subprocess.run(["kquitapp6", "plasmashell"], check=False)
+        if wait_until(lambda: not plasmashell_pids(), 6):
+            return
+        subprocess.run(["kill"] + [str(pid) for pid in plasmashell_pids()], check=False)
+        if wait_until(lambda: not plasmashell_pids(), 3):
+            return
+    if plasmashell_pids():
+        die("plasmashell did not stop")
+
+
+def start_shell():
+    if plasmashell_pids():
+        if wait_until(shell_owns_bus, 10):
+            return
+        die("plasmashell is running but not on the bus")
+    out = subprocess.run(["kstart", "plasmashell"], text=True, capture_output=True)
+    if out.returncode != 0:
+        die(out.stderr.strip() or "kstart plasmashell failed")
+    if not wait_until(shell_owns_bus, 15):
+        die("plasmashell did not come back")
+
+
+def with_shell_down(fn):
+    stopped = False
+    try:
+        stop_shell()
+        stopped = True
+        fn()
+    finally:
+        if stopped:
+            start_shell()
+
+
+def load_state():
+    if not STATE.exists():
+        return None
+    return json.loads(STATE.read_text(encoding="utf-8"))
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def is_hidden():
+    state = load_state()
+    return bool(state and state.get("hidden"))
+
+
+def write_filter(cid, mode, pattern):
+    general = ["Containments", cid, "General"]
+    if mode:
+        kwrite(general, "filterMode", mode)
+    else:
+        kwrite(general, "filterMode", delete=True)
+    if pattern:
+        kwrite(general, "filterPattern", pattern)
+    else:
+        kwrite(general, "filterPattern", delete=True)
+
+
+def apply_hidden():
+    if not CFG.is_file():
+        die("missing " + str(CFG))
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not BACKUP.exists():
+        shutil.copy2(CFG, BACKUP)
+    ids = folder_ids()
+    if not ids:
+        die("no folder desktop found")
+    saved = {}
+    for cid in ids:
+        general = ["Containments", cid, "General"]
+        saved[cid] = {
+            "filterMode": kread(general, "filterMode"),
+            "filterPattern": kread(general, "filterPattern"),
+        }
+        kwrite(general, "filterMode", "1")
+        kwrite(general, "filterPattern", PATTERN)
+    save_state({"hidden": True, "containments": saved})
+
+
+def apply_shown():
+    state = load_state() or {}
+    saved = state.get("containments") or {}
+    ids = list(saved) or folder_ids()
+    for cid in ids:
+        previous = saved.get(cid, {})
+        write_filter(cid, previous.get("filterMode", ""), previous.get("filterPattern", ""))
+    save_state({"hidden": False, "containments": {}})
+
+
+def cmd_on():
+    if is_hidden():
+        print("hidden")
+        return
+    with_shell_down(apply_hidden)
+    print("hidden")
+
+
+def cmd_off():
+    if not is_hidden():
+        print("shown")
+        return
+    with_shell_down(apply_shown)
+    print("shown")
+
+
+def cmd_status():
+    print("hidden" if is_hidden() else "shown")
+
+
+def main():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / "lock", "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    arg = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    if arg in ("-h", "--help"):
+        print("deskclear [on|off|status]")
+        print("on hides desktop folders and files. off shows them. no argument toggles.")
+        return
+    if arg == "on":
+        cmd_on()
+    elif arg == "off":
+        cmd_off()
+    elif arg == "status":
+        cmd_status()
+    elif arg == "toggle":
+        cmd_off() if is_hidden() else cmd_on()
+    else:
+        die("use on, off, or status")
+
+
+if __name__ == "__main__":
+    main()
